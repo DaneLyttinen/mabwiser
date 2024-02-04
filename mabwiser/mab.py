@@ -25,6 +25,7 @@ from mabwiser.linear import _Linear
 from mabwiser.neighbors import _KNearest, _Radius
 from mabwiser.popularity import _Popularity
 from mabwiser.rand import _Random
+from mabwiser.compliantthompson import _CompliantThompsonSampling
 from mabwiser.softmax import _Softmax
 from mabwiser.thompson import _ThompsonSampling
 from mabwiser.treebandit import _TreeBandit
@@ -38,6 +39,11 @@ __copyright__ = __copyright__
 
 
 class LearningPolicy(NamedTuple):
+    class CompliantThompsonSampling(NamedTuple):
+        l2_lambda: Num = 1
+        def _validate(self):
+            check_true(0 <= self.l2_lambda, ValueError("The value of l2_lambda must be more than 0."))
+
     class EpsilonGreedy(NamedTuple):
         """Epsilon Greedy Learning Policy.
 
@@ -676,7 +682,8 @@ LearningPolicyType = NewType('LearningPolicyType', Union[LearningPolicy.EpsilonG
                                                          LearningPolicy.UCB1,
                                                          LearningPolicy.LinGreedy,
                                                          LearningPolicy.LinTS,
-                                                         LearningPolicy.LinUCB])
+                                                         LearningPolicy.LinUCB,
+                                                         LearningPolicy.CompliantThompsonSampling])
 
 
 # NeighborhoodPolicyType is the Union of all possible neighborhood policies
@@ -863,6 +870,8 @@ class MAB:
             lp = _Softmax(self._rng, self.arms, self.n_jobs, self.backend, learning_policy.tau)
         elif isinstance(learning_policy, LearningPolicy.ThompsonSampling):
             lp = _ThompsonSampling(self._rng, self.arms, self.n_jobs, self.backend, learning_policy.binarizer)
+        elif isinstance(learning_policy, LearningPolicy.CompliantThompsonSampling):
+            lp = _CompliantThompsonSampling(self._rng, self.arms, self.n_jobs, self.backend, learning_policy.l2_lambda)
         elif isinstance(learning_policy, LearningPolicy.UCB1):
             lp = _UCB1(self._rng, self.arms, self.n_jobs, self.backend, learning_policy.alpha)
         elif isinstance(learning_policy, LearningPolicy.LinGreedy):
@@ -905,7 +914,7 @@ class MAB:
                 check_true(False, ValueError("Undefined context policy " + str(neighborhood_policy)))
         else:
             self.is_contextual = isinstance(learning_policy, (LearningPolicy.LinGreedy, LearningPolicy.LinTS,
-                                                              LearningPolicy.LinUCB))
+                                                              LearningPolicy.LinUCB, LearningPolicy.CompliantThompsonSampling))
             self._imp = lp
 
     @property
@@ -949,6 +958,8 @@ class MAB:
             return LearningPolicy.Softmax(lp.tau)
         elif isinstance(lp, _ThompsonSampling):
             return LearningPolicy.ThompsonSampling(lp.binarizer)
+        elif isinstance(lp, _CompliantThompsonSampling):
+            return LearningPolicy.CompliantThompsonSampling(lp.l2_lambda)
         elif isinstance(lp, _UCB1):
             return LearningPolicy.UCB1(lp.alpha)
         else:
@@ -1302,7 +1313,8 @@ class MAB:
         check_true(isinstance(learning_policy,
                               (LearningPolicy.EpsilonGreedy, LearningPolicy.Popularity, LearningPolicy.Random,
                                LearningPolicy.Softmax, LearningPolicy.ThompsonSampling, LearningPolicy.UCB1,
-                               LearningPolicy.LinGreedy, LearningPolicy.LinTS, LearningPolicy.LinUCB)),
+                               LearningPolicy.LinGreedy, LearningPolicy.LinTS, LearningPolicy.LinUCB,
+                               LearningPolicy.CompliantThompsonSampling)),
                    TypeError("Learning Policy type mismatch."))
 
         # Learning policy value
