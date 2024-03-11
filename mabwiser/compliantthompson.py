@@ -27,8 +27,8 @@ class LogisticModel(object):
         """
 
         w = np.array([0]*X.shape[1], dtype='float64') if self.w == None else self.w
-        y_bar = np.mean(y)
-        w_init = math.log(y_bar/(1-y_bar))
+        #y_bar = np.mean(y)
+        #w_init = math.log(y_bar/(1-y_bar))
         nll_sequence = [] if self.nll_sequence == None else self.nll_sequence
         for i in range(iterations):
             h = X.dot(w)
@@ -87,87 +87,107 @@ class _CompliantThompsonSampling(BaseMAB):
     def __init__(self, rng: _BaseRNG, arms: List[Arm], n_jobs: int, backend: Optional[str], l2_lambda: Num):
         super().__init__(rng, arms, n_jobs, backend)
         self.l2_lambda = l2_lambda
-        self.gram_matrix = {arm: np.eye(len(arms)) for arm in self.arms} 
-        self.reward_parameters = {arm: np.zeros(len(arms)) for arm in self.arms}  
-        self.compliance_parameters = {arm: np.zeros(len(arms)) for arm in self.arms}
-        self.arm_to_compliance_model = dict((arm, LogisticModel()) for arm in arms)
+        self.tau = 1000  # Initial exploration rounds
+        self.gram_matrix_theta = {}
+        self.gram_matrix_psi = {}
+        self.reward_parameters = {}
+        self.compliance_parameters = {}
+        self.compliance_models = {arm: LogisticModel() for arm in self.arms}
 
     def _update_reward_model(self, arm, feature_vector, reward):
-        self.gram_matrix[arm] += self.l2_lambda * np.eye(len(feature_vector))
-        gram_matrix_inv = inv(self.gram_matrix[arm])
+        # Update reward model using equation (1) from the paper
+        self.gram_matrix_theta[arm] += np.outer(feature_vector, feature_vector.T) + self.l2_lambda * np.eye(feature_vector.shape[0])
+        gram_matrix_inv_theta = np.linalg.inv(self.gram_matrix_theta[arm])
+        self.reward_parameters[arm] = gram_matrix_inv_theta @ (self.reward_parameters[arm] + feature_vector * reward)
 
-        # Sherman-Morrison formula for efficient update of the inverse Gram matrix
-        u = gram_matrix_inv @ feature_vector
-        v = feature_vector @ gram_matrix_inv
-        self.gram_matrix[arm] = gram_matrix_inv - np.outer(u, v) / (1 + feature_vector @ gram_matrix_inv @ feature_vector)
-
-        self.reward_parameters[arm] += self.gram_matrix[arm] @ feature_vector * (reward - feature_vector @ self.reward_parameters[arm])
-    
     def _update_compliance_model(self, arm, feature_vector, compliance):
-        max_iter = 20
-        tolerance = 1e-6
-        for _ in range(max_iter):
-            # Calculate the predicted probability
-            logits = np.dot(feature_vector, self.compliance_parameters[arm])
-            p = expit(logits)
+        # Ensure the feature vector is in the correct shape (n_samples, n_features)
+        # In this case, we are updating with one sample at a time, so reshape is needed
+        X = np.array(feature_vector).reshape(1, -1)  # Reshape to 2D array if necessary
+        y = np.array([compliance])  # Compliance is a scalar, so wrap it in an array
 
-            # Weight for each data point, which is just the variance of the Bernoulli distribution
-            weight = p * (1 - p)
+        # Check if the logistic model for this arm has been initialized
+        if arm not in self.compliance_models:
+            self.compliance_models[arm] = LogisticModel()
 
-            # Calculate 'z', the adjusted response variable
-            z = logits + (compliance - p) / weight
+        # Fit the logistic model with the new data
+        self.compliance_models[arm].fit(X, y)
 
-            # Update compliance parameters (using only the scalar weight)
-            self.compliance_parameters[arm] += (feature_vector * weight) * (z - logits)
-            # Check for convergence
-            if np.all(np.abs(self.compliance_parameters[arm] - self.compliance_parameters[arm]) < tolerance):
-                break
+        # After fitting, the model's weights are updated, and there's no need to manually update self.compliance_parameters
+        # as it's implicitly handled by the LogisticModel instance.
+        # However, you should update `self.compliance_parameters[arm]` if you use it elsewhere.
+        # This could be the logistic regression weights for the arm after fitting.
+        self.compliance_parameters[arm] = self.compliance_models[arm].w
+
+    def _sample_parameters(self):
+        # Sample reward parameters from their posterior distributions
+        sampled_reward_parameters = {
+            arm: np.random.multivariate_normal(self.reward_parameters[arm], inv(self.gram_matrix_theta[arm])) 
+            for arm in self.arms
+        }
+
+        # "Sample" compliance parameters - in this case, use the estimated parameters directly
+        # Optionally, introduce variability if needed, for example, by adding Gaussian noise based on the model's confidence intervals or another method
+        sampled_compliance_parameters = {
+            arm: self.compliance_models[arm].w  # Directly use logistic regression weights
+            for arm in self.arms
+        }
+
+        return sampled_reward_parameters, sampled_compliance_parameters
 
     def _predict_contexts(self, contexts: np.ndarray) -> List:
+        # Sample parameters from their posterior distributions
+        sampled_reward_parameters, sampled_compliance_parameters = self._sample_parameters()
+
         # Generate predictions for each context
         predictions = []
         for context in contexts:
-            arm_expectations = {arm: expit(context @ self.compliance_parameters[arm]) * (context @ self.reward_parameters[arm]) for arm in self.arms}
+            arm_expectations = {arm: expit(context @ sampled_compliance_parameters[arm]) * (context @ sampled_reward_parameters[arm]) for arm in self.arms}
             best_arm = argmax(arm_expectations)
             predictions.append(best_arm)
-        
+
         return predictions
 
-
     def _fit_arm(self, arm: Arm, decisions: np.ndarray, rewards: np.ndarray, contexts: Optional[np.ndarray] = None, compliances: np.ndarray = None):
-        # if (compliances == None):
-        #     compliances = np.ones(decisions.shape)
+        feature_dim = contexts.shape[1]
+        self.gram_matrix_theta[arm] = self.l2_lambda * np.eye(feature_dim)
+        self.gram_matrix_psi[arm] = self.l2_lambda * np.eye(feature_dim)
+        self.reward_parameters[arm] = np.zeros(feature_dim)
+        self.compliance_parameters[arm] = np.ones(feature_dim)
+        
         for context, reward in zip(contexts, rewards):
-            self.gram_matrix[arm] += self.l2_lambda * np.eye(len(context))
-            gram_matrix_inv = inv(self.gram_matrix[arm])
+            self._update_reward_model(arm, context, reward)
 
-            u = gram_matrix_inv @ context
-            v = context @ gram_matrix_inv
-            self.gram_matrix[arm] = gram_matrix_inv - np.outer(u, v) / (1 + context @ gram_matrix_inv @ context)
-
-            self.reward_parameters[arm] += self.gram_matrix[arm] @ context * (reward - context @ self.reward_parameters[arm])
-
-        # Update compliance model for the arm
         if compliances is not None:
             arm_compliances = compliances[decisions == arm]
             for context, compliance in zip(contexts, arm_compliances):
                 self._update_compliance_model(arm, context, compliance)
 
-    def fit(self, decisions: np.ndarray, rewards: np.ndarray,contexts: np.ndarray,compliances: np.ndarray = None):
-        if (compliances == None):
-            compliances = np.ones(contexts.shape)
-        # Reset Gram matrix and reward parameters
+    def fit(self, decisions: np.ndarray, rewards: np.ndarray, contexts: np.ndarray, compliances: np.ndarray = None):
+        if compliances is None:
+            compliances = np.ones(decisions.shape)
+        # Get feature dimension from the contexts
+        feature_dim = contexts.shape[1]
+
+        # Reset Gram matrices and parameters
         for arm in self.arms:
-            self.gram_matrix[arm] = np.eye(contexts.shape[1])
-            self.reward_parameters[arm] = np.zeros(contexts.shape[1])
-            self.compliance_parameters[arm] = np.zeros(contexts.shape[1])
+            self.gram_matrix_theta[arm] = self.l2_lambda * np.eye(feature_dim)
+            self.gram_matrix_psi[arm] = self.l2_lambda * np.eye(feature_dim)
+            self.reward_parameters[arm] = np.zeros(feature_dim)
+            self.compliance_parameters[arm] = np.ones(feature_dim)
 
-        for decision, reward, feature_vector in zip(decisions, rewards, contexts):
-            self._update_reward_model(decision, feature_vector, reward)
+        # Initial exploration phase
+        # for t in range(len(decisions)):
+        #     arm = self.rng.choice(self.arms)
+        #     decision, reward, context, compliance = decisions[t], rewards[t], contexts[t], compliances[t]
+        #     self._update_reward_model(arm, context, reward)
+        #     self._update_compliance_model(arm, context, compliance)
 
-        for decision, compliance, feature_vector in zip(decisions, compliances, contexts):
-            self._update_compliance_model(decision, feature_vector, compliance)
-        
+
+        for arm, reward, context, compliance in zip(self.arms, rewards, contexts, compliances):
+            self._update_reward_model(arm, context, reward)
+            self._update_compliance_model(arm, context, compliance)
+
         self._parallel_fit(decisions, rewards, contexts)
 
     def predict(self, contexts: Optional[np.ndarray] = None) -> Union[Arm, List[Arm]]:
@@ -192,28 +212,34 @@ class _CompliantThompsonSampling(BaseMAB):
 
     def predict_expectations(self, contexts: Optional[np.ndarray] = None, is_predict=False) -> Union[Dict[Arm, Num], List[Dict[Arm, Num]]]:
         if contexts is None:
-            # Create a default context array with the correct shape
-            default_context = np.ones((len(self.compliance_parameters[next(iter(self.compliance_parameters))]),))
+            # If no contexts are provided, assume a default context (e.g., a vector of ones)
+            default_context = np.ones((1, len(self.arms[0].features)))  # Adjust the size according to your features
             contexts = np.array([default_context])
-        
-        arms = deepcopy(self.arms)
-        ##arms = np.array(arms)
 
         num_contexts = contexts.shape[0]
-        arm_expectations = np.empty((num_contexts, len(arms)), dtype=float)
+        arm_expectations = np.empty((num_contexts, len(self.arms)), dtype=float)
 
-        for i, arm in enumerate(arms):
-            # Vectorized computation for each arm
-            compliance_prob = expit(contexts @ self.compliance_parameters[arm])
-            expected_reward = contexts @ self.reward_parameters[arm]
-            arm_expectations[:, i] = compliance_prob * expected_reward
+        sampled_reward_parameters, sampled_compliance_parameters = self._sample_parameters()
+
+        for i, arm in enumerate(self.arms):
+            # Calculate expected reward for each context and arm
+            for j, context in enumerate(contexts):
+                # Use logistic regression model to predict compliance probability
+                compliance_prob = self.compliance_models[arm].predict(context.reshape(1, -1), use_probability=True)
+                
+                # Compute expected reward
+                expected_reward = context.dot(sampled_reward_parameters[arm])
+                
+                # Multiply compliance probability with expected reward
+                arm_expectations[j, i] = compliance_prob * expected_reward
 
         if is_predict:
-            # Return the arm with the highest expectation for each context
-            return arms[np.argmax(arm_expectations, axis=1)].tolist()
+            # If predicting, return the arm with the highest expectation for each context
+            best_arms = np.argmax(arm_expectations, axis=1)
+            return [self.arms[i] for i in best_arms]
         else:
-            # Return a list of dictionaries mapping each arm to its expectation
-            return [dict(zip(arms, arm_expectations[i])) for i in range(num_contexts)]
+            # Otherwise, return a list of dictionaries mapping each arm to its expectation for each context
+            return [dict(zip(self.arms, arm_expectations[i])) for i in range(num_contexts)]
         
     def _copy_arms(self, cold_arm_to_warm_arm):
         for cold_arm, warm_arm in cold_arm_to_warm_arm.items():
@@ -221,14 +247,9 @@ class _CompliantThompsonSampling(BaseMAB):
             self.compliance_parameters[cold_arm] = deepcopy(self.compliance_parameters[warm_arm])
 
     def _uptake_new_arm(self, arm: Arm, binarizer: Callable = None, scaler: Callable = None):
-        if self.arms:
-            num_features = len(self.reward_parameters[next(iter(self.arms))])
-        else:
-            raise ValueError("No existing arms to infer the number of features.")
-
-        # Initialize the necessary parameters for a new arm
-        self.reward_parameters[arm] = np.zeros(num_features)
-        self.compliance_parameters[arm] = np.zeros(num_features)
+        # Add to untrained_arms arms
+        self.reward_parameters[arm] = None
+        self.compliance_parameters[arm] = None
 
     def _drop_existing_arm(self, arm: Arm):
         self.reward_parameters.pop(arm)
